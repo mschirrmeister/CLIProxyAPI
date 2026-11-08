@@ -1,12 +1,16 @@
 package connstats
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -101,21 +105,39 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	resp, err := rt.base.RoundTrip(req.WithContext(ctx))
 	if err != nil {
-		c.finishRequest(rec, false, err)
+		end := EndError
+		if errors.Is(err, context.Canceled) {
+			end = EndCancelled
+		}
+		c.finishRequest(rec, end, err)
 		return resp, err
 	}
 	if resp == nil {
-		c.finishRequest(rec, false, nil)
+		c.finishRequest(rec, EndError, nil)
 		return resp, err
 	}
 	c.gotResponse(rec, resp)
 	// A 101 body is the upgraded connection; leave it untouched.
 	if resp.StatusCode == http.StatusSwitchingProtocols || resp.Body == nil || resp.Body == http.NoBody {
-		c.finishRequest(rec, true, nil)
+		c.finishRequest(rec, EndNoBody, nil)
 		return resp, nil
 	}
-	resp.Body = &trackedBody{ReadCloser: resp.Body, rec: rec}
+	body := &trackedBody{ReadCloser: resp.Body, rec: rec}
+	// Only a plain event stream can be checked for its final event; a
+	// compressed one is left alone. A response without Content-Type to a
+	// request that asked for a stream counts as one (chatgpt.com sends none).
+	contentType := resp.Header.Get("Content-Type")
+	stream := isEventStream(contentType) || (contentType == "" && isEventStream(req.Header.Get("Accept")))
+	if stream && isIdentityEncoding(resp.Header.Get("Content-Encoding")) {
+		body.scan = true
+	}
+	resp.Body = body
 	return resp, nil
+}
+
+func isIdentityEncoding(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	return value == "" || value == "identity"
 }
 
 // CloseIdleConnections forwards to the wrapped transport so that
@@ -126,28 +148,113 @@ func (rt *roundTripper) CloseIdleConnections() {
 	}
 }
 
-// trackedBody ends the request record at EOF (complete) or at Close (early).
+// finalEventMarkers end an event stream in the protocols the proxy speaks
+// upstream. Each starts with a newline: inside a JSON string a newline is
+// escaped, so a match is stream framing and never generated text.
+var finalEventMarkers = [][]byte{
+	[]byte("\ndata: [DONE]"),                     // OpenAI chat completions, OpenRouter
+	[]byte("\nevent: message_stop"),              // Anthropic messages
+	[]byte("\nevent: response.completed"),        // OpenAI / Codex responses
+	[]byte("\nevent: response.done"),             // OpenAI responses (realtime style)
+	[]byte("\nevent: response.incomplete"),       // OpenAI responses, cut by max tokens
+	[]byte("\nevent: response.failed"),           // OpenAI responses, failed upstream
+	[]byte("\ndata: {\"type\":\"message_stop\""), // Anthropic without event lines
+}
+
+// maxMarkerLen bounds the bytes carried between reads so that a marker split
+// across two reads is still found.
+var maxMarkerLen = func() int {
+	n := 0
+	for _, m := range finalEventMarkers {
+		if len(m) > n {
+			n = len(m)
+		}
+	}
+	return n
+}()
+
+// trackedBody ends the request record at EOF, at a read error or at Close.
 // The record ends before the inner Close so that a transport closing its
 // connection with the body sees the request as finished.
 type trackedBody struct {
 	io.ReadCloser
 	rec  *requestState
 	once sync.Once
+
+	// scan enables the final-event check for plain event streams. Only Read
+	// touches carry and sawFinal; Close reads sawFinal after the last Read.
+	scan     bool
+	carry    []byte
+	sawFinal atomic.Bool
 }
 
 func (b *trackedBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
-	if err == io.EOF {
-		b.finish(true)
+	if n > 0 && b.scan && !b.sawFinal.Load() {
+		b.check(p[:n])
+	}
+	switch {
+	case err == nil:
+	case err == io.EOF:
+		b.finish(EndEOF, nil)
+	case errors.Is(err, context.Canceled):
+		// The caller gave up on the request; the stream was cut, not broken.
+		b.finish(EndCancelled, err)
+	default:
+		b.finish(EndReadError, err)
 	}
 	return n, err
 }
 
+// check looks for a final-event marker in chunk, including one that started
+// in the previous read.
+func (b *trackedBody) check(chunk []byte) {
+	if len(b.carry) > 0 {
+		head := chunk
+		if len(head) > maxMarkerLen-1 {
+			head = head[:maxMarkerLen-1]
+		}
+		joined := append(b.carry, head...)
+		if containsMarker(joined) {
+			b.sawFinal.Store(true)
+			return
+		}
+	}
+	if containsMarker(chunk) {
+		b.sawFinal.Store(true)
+		return
+	}
+	keep := maxMarkerLen - 1
+	if len(chunk) < keep {
+		// Short read: keep what is left of the old carry in front of it.
+		joined := append(b.carry, chunk...)
+		if len(joined) > keep {
+			joined = joined[len(joined)-keep:]
+		}
+		b.carry = append(b.carry[:0:0], joined...)
+		return
+	}
+	b.carry = append(b.carry[:0], chunk[len(chunk)-keep:]...)
+}
+
+func containsMarker(data []byte) bool {
+	for _, m := range finalEventMarkers {
+		if bytes.Contains(data, m) {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *trackedBody) Close() error {
-	b.finish(false)
+	end := EndClosedEarly
+	if b.sawFinal.Load() {
+		end = EndAfterFinalEvent
+	}
+	b.finish(end, nil)
 	return b.ReadCloser.Close()
 }
 
-func (b *trackedBody) finish(complete bool) {
-	b.once.Do(func() { b.rec.c.finishRequest(b.rec, complete, nil) })
+func (b *trackedBody) finish(end string, err error) {
+	b.once.Do(func() { b.rec.c.finishRequest(b.rec, end, err) })
 }

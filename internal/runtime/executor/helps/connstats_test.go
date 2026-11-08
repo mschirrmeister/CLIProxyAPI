@@ -98,7 +98,7 @@ func TestConnStatsClaudeCodeTransportRecordsReuse(t *testing.T) {
 		if r.Reused {
 			reused++
 		}
-		if r.Stream && r.Complete {
+		if r.Stream && r.End == connstats.EndEOF {
 			streamed++
 		}
 	}

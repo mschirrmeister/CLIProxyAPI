@@ -10,7 +10,15 @@ import (
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/connstats"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
+
+// Label upstream requests with the model the client asked for. The conductor
+// stores it on the execution context before an executor runs, so requests
+// built from that context carry it.
+func init() {
+	connstats.SetModelFunc(coreusage.RequestedModelAliasFromContext)
+}
 
 // InstrumentConnStats links the client's upstream requests to their
 // connections for the connection view, labelled with the credential.

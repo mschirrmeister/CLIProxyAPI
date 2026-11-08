@@ -102,7 +102,7 @@ func TestReuseIsRecordedAndServerCloseIsRemote(t *testing.T) {
 		t.Fatalf("reuse flags wrong: %+v", snap.Requests)
 	}
 	for _, r := range snap.Requests {
-		if r.ConnID != conn.ID || !r.Complete || r.Status != http.StatusOK {
+		if r.ConnID != conn.ID || r.End != EndEOF || r.Status != http.StatusOK {
 			t.Fatalf("request not linked or incomplete: %+v", r)
 		}
 		if strings.Contains(r.Path, "secret") {
@@ -182,8 +182,8 @@ func TestEarlyBodyCloseIsIncomplete(t *testing.T) {
 
 	snap := waitClosed(t, 1)
 	r := snap.Requests[0]
-	if r.Complete || !r.Stream || r.EndedAt == nil {
-		t.Fatalf("request = %+v, want ended, incomplete, stream", r)
+	if r.End != EndClosedEarly || !r.Stream || r.EndedAt == nil {
+		t.Fatalf("request = %+v, want ended early, stream", r)
 	}
 	if got := snap.Closed[0].CloseReason; got != CloseProxyAfterResponse {
 		t.Fatalf("close reason = %q, want %q", got, CloseProxyAfterResponse)
@@ -323,9 +323,9 @@ func TestNetConnUnwrap(t *testing.T) {
 
 func TestLocalCloseDuringRequestWaitsForOutcome(t *testing.T) {
 	for _, tc := range []struct {
-		complete bool
-		want     string
-	}{{true, CloseProxyAfterResponse}, {false, CloseProxyAborted}} {
+		end  string
+		want string
+	}{{EndEOF, CloseProxyAfterResponse}, {EndAfterFinalEvent, CloseProxyAfterResponse}, {EndClosedEarly, CloseProxyAborted}, {EndCancelled, CloseProxyAborted}} {
 		enable(t)
 		a, b := net.Pipe()
 		conn := Track(context.Background(), a, KindClaudeCode, "api.anthropic.com:443", time.Time{})
@@ -338,10 +338,10 @@ func TestLocalCloseDuringRequestWaitsForOutcome(t *testing.T) {
 		if snap := SnapshotSince(time.Time{}); len(snap.Open) != 1 || len(snap.Closed) != 0 {
 			t.Fatalf("close recorded before the request ended: open=%d closed=%d", len(snap.Open), len(snap.Closed))
 		}
-		col.finishRequest(rec, tc.complete, nil)
+		col.finishRequest(rec, tc.end, nil)
 		snap := SnapshotSince(time.Time{})
 		if len(snap.Closed) != 1 || snap.Closed[0].CloseReason != tc.want {
-			t.Fatalf("complete=%v: closed=%+v, want reason %q", tc.complete, snap.Closed, tc.want)
+			t.Fatalf("end=%s: closed=%+v, want reason %q", tc.end, snap.Closed, tc.want)
 		}
 	}
 }

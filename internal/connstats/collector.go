@@ -3,9 +3,11 @@
 // they carried and why they were closed. The management API exposes the result
 // so operators can see connection reuse per provider.
 //
-// Only metadata is kept. Headers, bodies, tokens and query strings are never
-// recorded. Collection is off by default and costs one atomic load per dial and
-// per request while disabled.
+// Only metadata is kept. Bodies, tokens and query strings are never recorded;
+// of the headers only the response Content-Type is kept. To tell a finished
+// stream from an interrupted one, the last bytes read from an event stream are
+// checked for a final-event marker and then discarded. Collection is off by
+// default and costs one atomic load per dial and per request while disabled.
 package connstats
 
 import (
@@ -100,14 +102,20 @@ type Conn struct {
 
 // Request is the exported snapshot of one upstream HTTP request.
 type Request struct {
-	ID          uint64     `json:"id"`
-	ConnID      uint64     `json:"conn_id,omitempty"`
-	Provider    string     `json:"provider,omitempty"`
-	AuthID      string     `json:"auth_id,omitempty"`
-	Method      string     `json:"method"`
-	Host        string     `json:"host"`
-	Path        string     `json:"path"`
-	Status      int        `json:"status,omitempty"`
+	ID       uint64 `json:"id"`
+	ConnID   uint64 `json:"conn_id,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	AuthID   string `json:"auth_id,omitempty"`
+	// Model is the model the client asked for, when the caller provides it.
+	Model  string `json:"model,omitempty"`
+	Method string `json:"method"`
+	Host   string `json:"host"`
+	Path   string `json:"path"`
+	Status int    `json:"status,omitempty"`
+	// ContentType is the Content-Type of the upstream response.
+	ContentType string `json:"content_type,omitempty"`
+	// Stream reports an event stream: the request asked for one (Accept) or
+	// the response is one (Content-Type).
 	Stream      bool       `json:"stream"`
 	Reused      bool       `json:"reused"`
 	WasIdle     bool       `json:"was_idle"`
@@ -115,8 +123,67 @@ type Request struct {
 	StartedAt   time.Time  `json:"started_at"`
 	FirstByteMs float64    `json:"first_byte_ms,omitempty"`
 	EndedAt     *time.Time `json:"ended_at,omitempty"`
-	Complete    bool       `json:"complete"`
-	Error       string     `json:"error,omitempty"`
+	// End tells how the response ended, one of the End* constants. It is
+	// empty while the request is in flight.
+	End   string `json:"end,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// How a request ended.
+const (
+	// EndEOF: the response body was read to the end.
+	EndEOF = "eof"
+	// EndAfterFinalEvent: the body was closed before its end, after the final
+	// event of the stream had arrived ([DONE], message_stop,
+	// response.completed, ...). Normal for streams.
+	EndAfterFinalEvent = "after_final_event"
+	// EndClosedEarly: the body was closed before its end and no final event
+	// was seen.
+	EndClosedEarly = "closed_early"
+	// EndCancelled: the request context was cancelled before the response
+	// ended, before or after its headers arrived. Usually the client went
+	// away; a deadline counts as EndError, not as a cancellation.
+	EndCancelled = "cancelled"
+	// EndReadError: reading the body failed, for example on a reset.
+	EndReadError = "read_error"
+	// EndError: the round trip failed before a response arrived.
+	EndError = "error"
+	// EndNoBody: the response has no body (101, 204, HEAD, ...).
+	EndNoBody = "no_body"
+	// EndSent: a WebSocket turn; the message was sent.
+	EndSent = "sent"
+)
+
+// endedNormally reports whether a request end counts as a finished exchange.
+func endedNormally(end string) bool {
+	switch end {
+	case EndEOF, EndAfterFinalEvent, EndNoBody, EndSent:
+		return true
+	}
+	return false
+}
+
+// ModelFunc returns the model a request was made for, read from its context.
+type ModelFunc func(ctx context.Context) string
+
+var modelFunc atomic.Pointer[ModelFunc]
+
+// SetModelFunc installs the function that labels requests with their model.
+// The executors register one that reads the model the client asked for.
+func SetModelFunc(fn ModelFunc) {
+	if fn == nil {
+		modelFunc.Store(nil)
+		return
+	}
+	modelFunc.Store(&fn)
+}
+
+func modelFromContext(ctx context.Context) string {
+	fn := modelFunc.Load()
+	if fn == nil || ctx == nil {
+		return ""
+	}
+	return (*fn)(ctx)
 }
 
 // Event marks something that helps reading the timeline, such as a restart or
@@ -465,7 +532,9 @@ func (c *collector) startRequest(provider, authID string, req *http.Request) *re
 	rec := &requestState{c: c, info: Request{
 		Provider:  provider,
 		AuthID:    authID,
+		Model:     modelFromContext(req.Context()),
 		Method:    req.Method,
+		Stream:    isEventStream(req.Header.Get("Accept")),
 		StartedAt: time.Now(),
 	}}
 	if req.URL != nil {
@@ -541,6 +610,13 @@ func (c *collector) gotConn(rec *requestState, info httptrace.GotConnInfo) {
 		return
 	}
 	c.bind(rec, st)
+	// A request bound at dial time was bound before its TLS handshake ended;
+	// take the handshake time now that it is known.
+	c.mu.Lock()
+	if rec.tlsMs > 0 && st.info.TLSMs == 0 {
+		st.info.TLSMs = rec.tlsMs
+	}
+	c.mu.Unlock()
 	if cs, ok := info.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
 		c.mu.Lock()
 		if st.info.TLSVersion == "" {
@@ -564,7 +640,16 @@ func (c *collector) gotResponse(rec *requestState, resp *http.Response) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	rec.info.Status = resp.StatusCode
-	rec.info.Stream = strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	rec.info.ContentType = resp.Header.Get("Content-Type")
+	if isEventStream(rec.info.ContentType) {
+		rec.info.Stream = true
+	}
+}
+
+// isEventStream reports whether an Accept or Content-Type value names
+// text/event-stream.
+func isEventStream(value string) bool {
+	return strings.Contains(strings.ToLower(value), "text/event-stream")
 }
 
 func (c *collector) firstByte(rec *requestState) {
@@ -573,7 +658,7 @@ func (c *collector) firstByte(rec *requestState) {
 	rec.info.FirstByteMs = durationMs(time.Since(rec.info.StartedAt))
 }
 
-func (c *collector) finishRequest(rec *requestState, complete bool, err error) {
+func (c *collector) finishRequest(rec *requestState, end string, err error) {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -582,7 +667,7 @@ func (c *collector) finishRequest(rec *requestState, complete bool, err error) {
 	}
 	rec.finished = true
 	rec.info.EndedAt = &now
-	rec.info.Complete = complete
+	rec.info.End = end
 	if err != nil {
 		rec.info.Error = err.Error()
 	}
@@ -591,7 +676,7 @@ func (c *collector) finishRequest(rec *requestState, complete bool, err error) {
 		st.inFlight.Add(-1)
 		if !st.pendingAt.IsZero() && st.inFlight.Load() == 0 {
 			reason := CloseProxyAborted
-			if complete && err == nil {
+			if endedNormally(end) && err == nil {
 				reason = CloseProxyAfterResponse
 				if st.info.Kind == KindChrome {
 					reason = CloseProxyPerRequest
@@ -697,7 +782,7 @@ func (c *collector) websocketTurn(key string) {
 		Host:      st.info.Addr,
 		StartedAt: now,
 		EndedAt:   &now,
-		Complete:  true,
+		End:       EndSent,
 		Reused:    reused,
 		Stream:    true,
 	}}
