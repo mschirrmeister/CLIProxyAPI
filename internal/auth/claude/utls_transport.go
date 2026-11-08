@@ -10,6 +10,7 @@ import (
 
 	tls "github.com/refraction-networking/utls"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/connstats"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
@@ -203,6 +204,7 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 		conn net.Conn
 		err  error
 	)
+	dialStart := time.Now()
 	if contextDialer, ok := t.dialer.(proxy.ContextDialer); ok {
 		conn, err = contextDialer.DialContext(ctx, network, addr)
 	} else {
@@ -211,6 +213,7 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 	if err != nil {
 		return nil, fmt.Errorf("claude oauth tls: dial upstream: %w", err)
 	}
+	conn = connstats.Track(ctx, conn, connstats.KindClaudeOAuth, addr, dialStart)
 
 	host, _, errSplit := net.SplitHostPort(addr)
 	if errSplit != nil {
@@ -232,12 +235,15 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 		handshakeCtx, cancelHandshake = context.WithTimeout(ctx, handshakeTimeout)
 		defer cancelHandshake()
 	}
+	handshakeStart := time.Now()
 	if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
 		if errClose := tlsConn.Close(); errClose != nil {
 			log.Debugf("claude oauth tls: close connection after handshake failure: %v", errClose)
 		}
 		return nil, fmt.Errorf("claude oauth tls: handshake upstream: %w", errHandshake)
 	}
+	state := tlsConn.ConnectionState()
+	connstats.NoteTLS(conn, handshakeStart, state.Version, state.NegotiatedProtocol, state.DidResume)
 	return httpwire.NewOrderedRequestConn(tlsConn, claudeOAuthRequestHeaderOrder), nil
 }
 

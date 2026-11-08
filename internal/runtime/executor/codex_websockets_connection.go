@@ -81,6 +81,7 @@ func writeWebsocketPayloadMessage(provider string, sess *codexWebsocketSession, 
 		log.Warnf("%s websockets: write payload failed session=%s session_object=%s bytes=%d duration=%v err=%v", provider, sessionID, sessionKind, payloadBytes, time.Since(start), errSend)
 	} else {
 		log.Debugf("%s websockets: write payload completed session=%s session_object=%s bytes=%d duration=%v", provider, sessionID, sessionKind, payloadBytes, time.Since(start))
+		helps.NoteWebsocketTurn(conn)
 	}
 	return errSend
 }
@@ -243,8 +244,9 @@ func executionProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxyau
 	return proxyURL
 }
 
-func newProxyAwareWebsocketDialer(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
-	dialer := &websocket.Dialer{
+func newProxyAwareWebsocketDialer(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (dialer *websocket.Dialer) {
+	defer func() { helps.TrackWebsocketDialer(dialer, auth) }()
+	dialer = &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
 		EnableCompression: true,

@@ -15,6 +15,7 @@ import (
 	tls "github.com/refraction-networking/utls"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/connstats"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
@@ -74,16 +75,19 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 	if !ok {
 		return nil, fmt.Errorf("utls: dialer does not support context cancellation")
 	}
+	dialStart := time.Now()
 	conn, errDial := contextDialer.DialContext(ctx, "tcp", addr)
 	if errDial != nil {
 		return nil, fmt.Errorf("utls: dial upstream: %w", errDial)
 	}
+	conn = connstats.Track(ctx, conn, connstats.KindChrome, addr, dialStart)
 
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
 
 	handshakeCtx, cancelHandshake := handshakeContext(ctx)
 	defer cancelHandshake()
+	handshakeStart := time.Now()
 	if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
 		errHandshake = classifyHandshakeError(ctx, handshakeCtx, errHandshake)
 		if errors.Is(errHandshake, context.Canceled) || errors.Is(errHandshake, context.DeadlineExceeded) {
@@ -94,6 +98,7 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 		}
 		return nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
 	}
+	noteUtlsHandshake(conn, handshakeStart, tlsConn)
 
 	return tlsConn, nil
 }
@@ -381,6 +386,7 @@ func newClaudeCodeRoundTripperForDialerAndRoots(dialer proxy.Dialer, roots *x509
 				conn net.Conn
 				err  error
 			)
+			dialStart := time.Now()
 			if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
 				conn, err = contextDialer.DialContext(ctx, network, addr)
 			} else {
@@ -389,7 +395,7 @@ func newClaudeCodeRoundTripperForDialerAndRoots(dialer proxy.Dialer, roots *x509
 			if err != nil {
 				return nil, fmt.Errorf("claude tls: dial upstream: %w", err)
 			}
-			conn = stampProxyKeepAlive(conn)
+			conn = connstats.Track(ctx, stampProxyKeepAlive(conn), connstats.KindClaudeCode, addr, dialStart)
 
 			host, _, errSplit := net.SplitHostPort(addr)
 			if errSplit != nil {
@@ -407,6 +413,7 @@ func newClaudeCodeRoundTripperForDialerAndRoots(dialer proxy.Dialer, roots *x509
 			}
 			handshakeCtx, cancelHandshake := handshakeContext(ctx)
 			defer cancelHandshake()
+			handshakeStart := time.Now()
 			if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
 				errHandshake = classifyHandshakeError(ctx, handshakeCtx, errHandshake)
 				if errClose := tlsConn.Close(); errClose != nil {
@@ -414,6 +421,7 @@ func newClaudeCodeRoundTripperForDialerAndRoots(dialer proxy.Dialer, roots *x509
 				}
 				return nil, fmt.Errorf("claude tls: handshake upstream: %w", errHandshake)
 			}
+			noteUtlsHandshake(conn, handshakeStart, tlsConn)
 			return httpwire.NewOrderedRequestConn(tlsConn, claudeCodeRequestHeaderOrder), nil
 		},
 	}
@@ -490,6 +498,7 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		if clientOut != nil && handshakeTimeout > 0 {
 			clientOut.Transport = &tlsHandshakeTimeoutRoundTripper{base: clientOut.Transport, timeout: handshakeTimeout}
 		}
+		clientOut = InstrumentConnStats(ctx, clientOut, auth)
 	}()
 	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 

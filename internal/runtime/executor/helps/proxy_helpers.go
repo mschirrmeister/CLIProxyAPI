@@ -34,7 +34,7 @@ import (
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (clientOut *http.Client) {
-	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
+	defer func() { clientOut = InstrumentConnStats(ctx, httptransport.Decorate(ctx, clientOut), auth) }()
 	httpClient := &http.Client{}
 	if timeout > 0 {
 		httpClient.Timeout = timeout
@@ -497,7 +497,11 @@ func buildPooledBaseTransport(proxyURL string) (*http.Transport, error) {
 // default of hours; a peer that died silently would then pin a pooled connection for
 // that long. Keepalive only probes idle sockets, so a live stream is never cut.
 func stampProxyKeepAlive(conn net.Conn) net.Conn {
-	tcp, ok := conn.(*net.TCPConn)
+	raw := conn
+	if wrapped, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		raw = wrapped.NetConn() // connection tracking wraps the TCP conn
+	}
+	tcp, ok := raw.(*net.TCPConn)
 	if !ok {
 		return conn
 	}
@@ -515,7 +519,7 @@ var devinTransportCache = NewTransportCache[string](DefaultTransportCacheCapacit
 // NewDevinHTTPClient creates an HTTP client customized for Devin Connect-RPC upstream.
 // Suppresses automatic Accept-Encoding: gzip while preserving connection reuse across requests.
 func NewDevinHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (clientOut *http.Client) {
-	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
+	defer func() { clientOut = InstrumentConnStats(ctx, httptransport.Decorate(ctx, clientOut), auth) }()
 	// A request proxy replaces both the injected round tripper and credential/global proxy.
 	// Respect explicitly injected context RoundTripper only when no request override is set.
 	if cliproxyexecutor.RequestProxyURL(ctx) == "" && ctx != nil {
