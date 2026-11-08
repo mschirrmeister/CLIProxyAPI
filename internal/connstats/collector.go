@@ -44,6 +44,7 @@ const (
 	CloseProxyIdle          = "proxy_idle"
 	CloseProxyAborted       = "proxy_aborted"
 	CloseProxyUnused        = "proxy_unused"
+	CloseProxyClosed        = "proxy_closed"
 	CloseWSLocal            = "ws_closed_local"
 	CloseWSRemote           = "ws_closed_remote"
 	CloseError              = "error"
@@ -63,6 +64,10 @@ const (
 	// idle connection is the transport reacting to a server close (TLS
 	// close_notify, HTTP/2 GOAWAY) that the TLS layer above the wrapper consumed.
 	idleReadWindow = time.Second
+	// quietGap is how long a connection must be silent before arriving bytes
+	// count as unsolicited. It lets server closes be recognized on connections
+	// whose client is not instrumented and therefore has no request records.
+	quietGap = time.Second
 )
 
 // Conn is the exported snapshot of one upstream connection.
@@ -155,12 +160,14 @@ type connState struct {
 	// idleReadAt is set when bytes arrive while no request is in flight on a
 	// connection that already served one.
 	idleReadAt atomic.Int64
-	requests   atomic.Int32
-	inFlight   atomic.Int32
-	lastEnd    atomic.Int64 // unix nanos of the last request end
-	closed     atomic.Bool
-	localKey   string    // guarded by c.mu
-	pendingAt  time.Time // guarded by c.mu; local close waiting for its request to end
+	// quietReadAt is set when bytes arrive after at least quietGap of silence.
+	quietReadAt atomic.Int64
+	requests    atomic.Int32
+	inFlight    atomic.Int32
+	lastEnd     atomic.Int64 // unix nanos of the last request end
+	closed      atomic.Bool
+	localKey    string    // guarded by c.mu
+	pendingAt   time.Time // guarded by c.mu; local close waiting for its request to end
 }
 
 type requestState struct {
@@ -411,14 +418,23 @@ func classify(st *connState, origin closeOrigin, now time.Time) string {
 	if ws {
 		return CloseWSLocal
 	}
-	if t := st.idleReadAt.Load(); t != 0 && inFlight == 0 && now.Sub(time.Unix(0, t)) <= idleReadWindow {
+	recent := func(t int64) bool { return t != 0 && now.Sub(time.Unix(0, t)) <= idleReadWindow }
+	if inFlight == 0 && recent(st.idleReadAt.Load()) {
 		return CloseServerIdle
 	}
 	if inFlight > 0 {
 		return CloseProxyAborted
 	}
 	if st.requests.Load() == 0 {
-		return CloseProxyUnused
+		// No request records: either unused, or used by a client that is not
+		// instrumented. Fall back to the wire pattern alone.
+		if recent(st.quietReadAt.Load()) {
+			return CloseServerIdle
+		}
+		if st.bytesIn.Load() == 0 {
+			return CloseProxyUnused
+		}
+		return CloseProxyClosed
 	}
 	if end := st.lastEnd.Load(); end != 0 && now.Sub(time.Unix(0, end)) <= afterResponseWindow {
 		if st.info.Kind == KindChrome {

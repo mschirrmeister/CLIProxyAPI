@@ -77,7 +77,9 @@ func (c *trackedConn) Read(p []byte) (int, error) {
 	if n > 0 {
 		now := time.Now().UnixNano()
 		c.st.bytesIn.Add(int64(n))
-		c.st.lastIO.Store(now)
+		if prev := c.st.lastIO.Swap(now); now-prev >= int64(quietGap) {
+			c.st.quietReadAt.Store(now)
+		}
 		if c.st.inFlight.Load() == 0 && c.st.requests.Load() > 0 {
 			c.st.idleReadAt.Store(now)
 		}

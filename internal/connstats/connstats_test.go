@@ -251,12 +251,17 @@ func TestClassify(t *testing.T) {
 		{"stale idle read", KindClaudeCode, originLocal, 3, 0, ago(400 * time.Second), ago(time.Minute), CloseProxyIdle},
 		{"aborted", KindClaudeCode, originLocal, 1, 1, 0, 0, CloseProxyAborted},
 		{"unused", KindStandard, originLocal, 0, 0, 0, 0, CloseProxyUnused},
+		{"no request info", KindStandard, originLocal, -1, 0, 0, 0, CloseProxyClosed},
 		{"after response", KindClaudeCode, originLocal, 1, 0, ago(time.Millisecond), 0, CloseProxyAfterResponse},
 		{"per request", KindChrome, originLocal, 1, 0, ago(time.Millisecond), 0, CloseProxyPerRequest},
 		{"idle timeout", KindStandard, originLocal, 1, 0, ago(90 * time.Second), 0, CloseProxyIdle},
 	}
 	for _, tc := range cases {
 		st := &connState{info: Conn{Kind: tc.kind}}
+		if tc.requests < 0 { // uninstrumented client: traffic but no request records
+			tc.requests = 0
+			st.bytesIn.Store(5000)
+		}
 		st.requests.Store(tc.requests)
 		st.inFlight.Store(tc.inFlight)
 		st.lastEnd.Store(tc.lastEnd)
@@ -374,5 +379,30 @@ func TestWebsocketTurnsCountAsRequests(t *testing.T) {
 	NoteWebsocketTurn(listener.Addr())
 	if got := SnapshotSince(time.Time{}).Totals.Requests; got != 3 {
 		t.Fatalf("requests after unknown address = %d", got)
+	}
+}
+
+// A client that is not instrumented leaves no request records; a server close
+// on its idle connection must still be recognized from the wire pattern.
+func TestServerCloseWithoutRequestRecords(t *testing.T) {
+	enable(t)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	tr := trackedTransport()
+	tr.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
+	get(t, &http.Client{Transport: tr}, srv.URL) // not instrumented
+	// Age the connection so the close arrives after a quiet period, without a
+	// wall-clock sleep.
+	col.mu.Lock()
+	for _, st := range col.open {
+		st.lastIO.Store(time.Now().Add(-2 * quietGap).UnixNano())
+	}
+	col.mu.Unlock()
+	srv.CloseClientConnections()
+	snap := waitClosed(t, 1)
+	if c := snap.Closed[0]; c.Requests != 0 || c.CloseReason != CloseServerIdle {
+		t.Fatalf("conn = requests %d reason %q, want 0 and %q", c.Requests, c.CloseReason, CloseServerIdle)
 	}
 }
