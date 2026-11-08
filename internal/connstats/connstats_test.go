@@ -325,7 +325,7 @@ func TestLocalCloseDuringRequestWaitsForOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		end  string
 		want string
-	}{{EndEOF, CloseProxyAfterResponse}, {EndAfterFinalEvent, CloseProxyAfterResponse}, {EndClosedEarly, CloseProxyAborted}, {EndCancelled, CloseProxyAborted}} {
+	}{{EndEOF, CloseProxyAfterResponse}, {EndAfterFinalEvent, CloseProxyAfterResponse}, {EndClosedUnchecked, CloseProxyAfterResponse}, {EndClosedEarly, CloseProxyAborted}, {EndCancelled, CloseProxyAborted}} {
 		enable(t)
 		a, b := net.Pipe()
 		conn := Track(context.Background(), a, KindClaudeCode, "api.anthropic.com:443", time.Time{})

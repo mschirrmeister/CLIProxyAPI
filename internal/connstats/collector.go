@@ -125,6 +125,9 @@ type Request struct {
 	Status int    `json:"status,omitempty"`
 	// ContentType is the Content-Type of the upstream response.
 	ContentType string `json:"content_type,omitempty"`
+	// Encoding is the Content-Encoding of the response as the caller reads
+	// it; empty when it is plain or the transport decompressed it.
+	Encoding string `json:"encoding,omitempty"`
 	// Stream reports an event stream: the request asked for one (Accept) or
 	// the response is one (Content-Type).
 	Stream      bool       `json:"stream"`
@@ -151,6 +154,10 @@ const (
 	// EndClosedEarly: the body was closed before its end and no final event
 	// was seen.
 	EndClosedEarly = "closed_early"
+	// EndClosedUnchecked: a compressed event stream was closed before its
+	// end. Its final event cannot be checked without decompressing it, so
+	// whether it was complete is unknown.
+	EndClosedUnchecked = "closed_unchecked"
 	// EndCancelled: the request context was cancelled before the response
 	// ended, before or after its headers arrived. Usually the client went
 	// away; a deadline counts as EndError, not as a cancellation.
@@ -166,9 +173,11 @@ const (
 )
 
 // endedNormally reports whether a request end counts as a finished exchange.
+// An unchecked stream counts as one: a connection closed after it is not
+// called aborted without evidence.
 func endedNormally(end string) bool {
 	switch end {
-	case EndEOF, EndAfterFinalEvent, EndNoBody, EndSent:
+	case EndEOF, EndAfterFinalEvent, EndClosedUnchecked, EndNoBody, EndSent:
 		return true
 	}
 	return false
@@ -719,6 +728,9 @@ func (c *collector) gotResponse(rec *requestState, resp *http.Response) {
 	defer c.mu.Unlock()
 	rec.info.Status = resp.StatusCode
 	rec.info.ContentType = resp.Header.Get("Content-Type")
+	if enc := resp.Header.Get("Content-Encoding"); !isIdentityEncoding(enc) {
+		rec.info.Encoding = strings.ToLower(strings.TrimSpace(enc))
+	}
 	if isEventStream(rec.info.ContentType) {
 		rec.info.Stream = true
 	}

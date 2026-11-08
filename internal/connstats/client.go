@@ -120,12 +120,17 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	body := &trackedBody{ReadCloser: resp.Body, rec: rec}
 	// Only a plain event stream can be checked for its final event; a
-	// compressed one is left alone. A response without Content-Type to a
-	// request that asked for a stream counts as one (chatgpt.com sends none).
+	// compressed one is left alone and reported as unchecked when closed
+	// early. A response without Content-Type to a request that asked for a
+	// stream counts as one (chatgpt.com sends none).
 	contentType := resp.Header.Get("Content-Type")
 	stream := isEventStream(contentType) || (contentType == "" && isEventStream(req.Header.Get("Accept")))
-	if stream && isIdentityEncoding(resp.Header.Get("Content-Encoding")) {
-		body.scan = true
+	if stream {
+		if isIdentityEncoding(resp.Header.Get("Content-Encoding")) {
+			body.scan = true
+		} else {
+			body.unchecked = true
+		}
 	}
 	resp.Body = body
 	return resp, nil
@@ -182,6 +187,8 @@ type trackedBody struct {
 	scan     bool
 	carry    []byte
 	sawFinal atomic.Bool
+	// unchecked marks a compressed event stream, which cannot be scanned.
+	unchecked bool
 }
 
 func (b *trackedBody) Read(p []byte) (int, error) {
@@ -244,8 +251,11 @@ func containsMarker(data []byte) bool {
 
 func (b *trackedBody) Close() error {
 	end := EndClosedEarly
-	if b.sawFinal.Load() {
+	switch {
+	case b.sawFinal.Load():
 		end = EndAfterFinalEvent
+	case b.unchecked:
+		end = EndClosedUnchecked
 	}
 	b.finish(end, nil)
 	return b.ReadCloser.Close()
