@@ -63,6 +63,9 @@ type Config struct {
 	// Pprof config controls the optional pprof HTTP debug server.
 	Pprof PprofConfig `yaml:"pprof" json:"pprof"`
 
+	// ConnectionObservability records upstream connection metadata for the management API.
+	ConnectionObservability ConnectionObservabilityConfig `yaml:"connection-observability" json:"connection-observability"`
+
 	// Discovery configures local network mDNS / DNS-SD service advertising.
 	Discovery DiscoveryConfig `yaml:"discovery" json:"discovery"`
 
