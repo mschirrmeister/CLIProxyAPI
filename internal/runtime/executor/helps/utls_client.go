@@ -80,7 +80,7 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 	if errDial != nil {
 		return nil, fmt.Errorf("utls: dial upstream: %w", errDial)
 	}
-	conn = connstats.Track(ctx, conn, connstats.KindChrome, addr, dialStart)
+	conn = connstats.TrackVia(ctx, conn, connstats.KindChrome, addr, t.dialer, dialStart)
 
 	tlsConfig := &tls.Config{ServerName: host}
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
@@ -395,7 +395,7 @@ func newClaudeCodeRoundTripperForDialerAndRoots(dialer proxy.Dialer, roots *x509
 			if err != nil {
 				return nil, fmt.Errorf("claude tls: dial upstream: %w", err)
 			}
-			conn = connstats.Track(ctx, stampProxyKeepAlive(conn), connstats.KindClaudeCode, addr, dialStart)
+			conn = connstats.TrackVia(ctx, stampProxyKeepAlive(conn), connstats.KindClaudeCode, addr, dialer, dialStart)
 
 			host, _, errSplit := net.SplitHostPort(addr)
 			if errSplit != nil {

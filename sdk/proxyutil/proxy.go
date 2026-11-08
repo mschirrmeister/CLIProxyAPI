@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/connstats"
 	"golang.org/x/net/proxy"
 )
 
@@ -140,9 +141,11 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 			}
 			transport := cloneDefaultTransport()
 			transport.Proxy = nil
-			transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+			// This dial function replaces the tracked one of the default
+			// transport, so it is tracked here, with the proxy it tunnels through.
+			transport.DialContext = connstats.WrapProxyDialContext(func(_ context.Context, network, addr string) (net.Conn, error) {
 				return dialer.Dial(network, addr)
-			}
+			}, connstats.KindStandard, socksProxyAddr(setting.URL))
 			return transport, setting.Mode, nil
 		}
 		if setting.URL.Scheme == "https" {
@@ -230,7 +233,7 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 		if errDialer != nil {
 			return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
 		}
-		return dialer, setting.Mode, nil
+		return &socksDialer{Dialer: dialer, addr: socksProxyAddr(setting.URL)}, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}
@@ -240,6 +243,36 @@ type httpConnectDialer struct {
 	proxyURL  *url.URL
 	dialer    proxy.Dialer
 	tlsConfig *tls.Config
+}
+
+// ProxyAddr reports the proxy this dialer tunnels through, for the connection
+// view. It never includes credentials.
+func (d *httpConnectDialer) ProxyAddr() string { return proxyDialAddr(d.proxyURL) }
+
+// socksDialer is a SOCKS5 dialer that reports its proxy, like httpConnectDialer.
+type socksDialer struct {
+	proxy.Dialer
+	addr string
+}
+
+// ProxyAddr reports the SOCKS5 proxy, without credentials.
+func (d *socksDialer) ProxyAddr() string { return d.addr }
+
+// DialContext keeps the wrapped dialer's context support visible.
+func (d *socksDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if contextDialer, ok := d.Dialer.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, addr)
+	}
+	return d.Dialer.Dial(network, addr)
+}
+
+// socksProxyAddr is the host:port of a SOCKS5 proxy URL, with the default port.
+func socksProxyAddr(proxyURL *url.URL) string {
+	port := proxyURL.Port()
+	if port == "" {
+		port = "1080"
+	}
+	return net.JoinHostPort(proxyURL.Hostname(), port)
 }
 
 func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {

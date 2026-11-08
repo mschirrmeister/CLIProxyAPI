@@ -24,17 +24,32 @@ type trackedConn struct {
 // addr the dial target and dialStart the time the dial began (zero if unknown).
 // It returns conn unchanged when collection is off or conn is already tracked.
 func Track(ctx context.Context, conn net.Conn, kind, addr string, dialStart time.Time) net.Conn {
-	return track(ctx, conn, kind, addr, dialStart, "", "")
+	return track(ctx, conn, kind, addr, "", dialStart, "", "")
 }
 
-func track(ctx context.Context, conn net.Conn, kind, addr string, dialStart time.Time, provider, authID string) net.Conn {
+// TrackVia is Track for a connection that dialer opened. When the dialer
+// tunnels through a proxy (see ProxyAddr), the connection records that proxy.
+func TrackVia(ctx context.Context, conn net.Conn, kind, addr string, dialer any, dialStart time.Time) net.Conn {
+	return track(ctx, conn, kind, addr, ProxyAddr(dialer), dialStart, "", "")
+}
+
+// ProxyAddr returns the proxy (host:port) a dialer tunnels through, or "" for
+// a direct dialer. Proxy dialers report it with a ProxyAddr() string method.
+func ProxyAddr(dialer any) string {
+	if p, ok := dialer.(interface{ ProxyAddr() string }); ok {
+		return p.ProxyAddr()
+	}
+	return ""
+}
+
+func track(ctx context.Context, conn net.Conn, kind, addr, via string, dialStart time.Time, provider, authID string) net.Conn {
 	if conn == nil || !col.enabled.Load() {
 		return conn
 	}
 	if _, ok := conn.(*trackedConn); ok {
 		return conn
 	}
-	st := col.openConn(ctx, conn, kind, addr, dialStart, provider, authID)
+	st := col.openConn(ctx, conn, kind, addr, via, dialStart, provider, authID)
 	return &trackedConn{Conn: conn, st: st}
 }
 
@@ -52,6 +67,16 @@ func NoteTLS(conn net.Conn, handshakeStart time.Time, version uint16, alpn strin
 // creates. provider and authID label the connection when set; otherwise the
 // labels come from the dial context (see Instrument).
 func WrapDialContext(dial DialContextFunc, kind, provider, authID string) DialContextFunc {
+	return wrapDialContext(dial, kind, "", provider, authID)
+}
+
+// WrapProxyDialContext is WrapDialContext for a dial function that tunnels
+// through the proxy via (host:port) itself, such as a SOCKS5 dialer.
+func WrapProxyDialContext(dial DialContextFunc, kind, via string) DialContextFunc {
+	return wrapDialContext(dial, kind, via, "", "")
+}
+
+func wrapDialContext(dial DialContextFunc, kind, via, provider, authID string) DialContextFunc {
 	if dial == nil {
 		return nil
 	}
@@ -64,7 +89,7 @@ func WrapDialContext(dial DialContextFunc, kind, provider, authID string) DialCo
 		if err != nil {
 			return conn, err
 		}
-		return track(ctx, conn, kind, addr, start, provider, authID), nil
+		return track(ctx, conn, kind, addr, via, start, provider, authID), nil
 	}
 }
 

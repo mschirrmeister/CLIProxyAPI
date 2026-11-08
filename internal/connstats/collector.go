@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -74,18 +75,28 @@ const (
 
 // Conn is the exported snapshot of one upstream connection.
 type Conn struct {
-	ID             uint64     `json:"id"`
-	Kind           string     `json:"kind"`
-	Provider       string     `json:"provider,omitempty"`
-	AuthID         string     `json:"auth_id,omitempty"`
-	Addr           string     `json:"addr"`
-	Local          string     `json:"local,omitempty"`
-	Remote         string     `json:"remote,omitempty"`
-	Proto          string     `json:"proto,omitempty"`
-	TLSVersion     string     `json:"tls_version,omitempty"`
-	ALPN           string     `json:"alpn,omitempty"`
-	TLSResumed     bool       `json:"tls_resumed"`
-	DialMs         float64    `json:"dial_ms"`
+	ID       uint64 `json:"id"`
+	Kind     string `json:"kind"`
+	Provider string `json:"provider,omitempty"`
+	AuthID   string `json:"auth_id,omitempty"`
+	// Addr is the upstream target (host:port), also when the connection runs
+	// through a proxy.
+	Addr string `json:"addr"`
+	// Proxy is the proxy (host:port) the connection is tunneled through, empty
+	// for a direct connection. Proxy credentials are never recorded.
+	Proxy      string `json:"proxy,omitempty"`
+	Local      string `json:"local,omitempty"`
+	Remote     string `json:"remote,omitempty"`
+	Proto      string `json:"proto,omitempty"`
+	TLSVersion string `json:"tls_version,omitempty"`
+	ALPN       string `json:"alpn,omitempty"`
+	TLSResumed bool   `json:"tls_resumed"`
+	// DialMs is the time until the connection reached the target, including
+	// the proxy tunnel.
+	DialMs float64 `json:"dial_ms"`
+	// ProxyMs is the part of DialMs spent setting up the proxy tunnel (CONNECT,
+	// and TLS to an https proxy), when it can be measured separately.
+	ProxyMs        float64    `json:"proxy_ms,omitempty"`
 	TLSMs          float64    `json:"tls_ms,omitempty"`
 	OpenedAt       time.Time  `json:"opened_at"`
 	ClosedAt       *time.Time `json:"closed_at,omitempty"`
@@ -235,6 +246,10 @@ type connState struct {
 	closed      atomic.Bool
 	localKey    string    // guarded by c.mu
 	pendingAt   time.Time // guarded by c.mu; local close waiting for its request to end
+	// tunnelAfterDial: the transport sets up the proxy tunnel after the dial
+	// (an HTTP proxy dialed by a standard transport), so it can be timed.
+	tunnelAfterDial bool    // guarded by c.mu
+	tcpDialMs       float64 // guarded by c.mu; the dial to the proxy alone
 }
 
 type requestState struct {
@@ -244,6 +259,11 @@ type requestState struct {
 	finished bool
 	tlsStart time.Time
 	tlsMs    float64
+	// target is the canonical host:port of the request URL.
+	target string
+	// dialing is the connection dialed for this request. Unlike conn it does
+	// not move when the request ends up on another connection.
+	dialing *connState
 }
 
 type collector struct {
@@ -330,7 +350,11 @@ func (c *collector) trimLocked() {
 	}
 }
 
-func (c *collector) openConn(ctx context.Context, raw net.Conn, kind, addr string, dialStart time.Time, provider, authID string) *connState {
+// openConn registers a dialed connection. via is the proxy the dialer tunnels
+// through, when the dialer knows it. A standard transport dials an HTTP proxy
+// itself, so a dial address that differs from the target of the request being
+// dialed for is that proxy.
+func (c *collector) openConn(ctx context.Context, raw net.Conn, kind, addr, via string, dialStart time.Time, provider, authID string) *connState {
 	now := time.Now()
 	st := &connState{c: c}
 	st.lastIO.Store(now.UnixNano())
@@ -352,8 +376,18 @@ func (c *collector) openConn(ctx context.Context, raw net.Conn, kind, addr strin
 	if kind == KindWebSocket {
 		st.info.Proto = "websocket"
 	}
+	rec := requestFromContext(ctx)
+	switch {
+	case via != "":
+		st.info.Proxy = via
+	case kind == KindStandard && rec != nil && rec.target != "" && !strings.EqualFold(rec.target, addr):
+		st.info.Proxy = addr
+		st.info.Addr = rec.target
+		st.tunnelAfterDial = true
+	}
 	if !dialStart.IsZero() {
 		st.info.DialMs = durationMs(now.Sub(dialStart))
+		st.tcpDialMs = st.info.DialMs
 	}
 	if a := raw.LocalAddr(); a != nil {
 		st.info.Local = a.String()
@@ -375,10 +409,53 @@ func (c *collector) openConn(ctx context.Context, raw net.Conn, kind, addr strin
 	c.totals.ConnsOpened++
 	c.mu.Unlock()
 
-	if rec := requestFromContext(ctx); rec != nil {
+	if rec != nil {
+		c.mu.Lock()
+		rec.dialing = st
+		c.mu.Unlock()
 		c.bind(rec, st)
 	}
 	return st
+}
+
+// tlsStarting marks the start of a TLS handshake for rec. On a connection that a
+// standard transport tunnels through an HTTP proxy, the handshake with the
+// target starts once the tunnel is up, so the time since the dial ended is the
+// tunnel setup. It counts towards the dial: DialMs is the time to reach the
+// target, whatever the path. With an https proxy the transport may first
+// shake hands with the proxy; the last handshake, the target's, decides.
+func (c *collector) tlsStarting(rec *requestState) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rec.tlsStart = now
+	st := rec.dialing
+	if st == nil || !st.tunnelAfterDial {
+		return
+	}
+	tunnel := durationMs(now.Sub(st.info.OpenedAt))
+	st.info.ProxyMs = tunnel
+	st.info.DialMs = st.tcpDialMs + tunnel
+}
+
+// canonicalAddr returns host:port for a request URL, with the scheme's default
+// port when the URL has none, the way net/http dials it.
+func canonicalAddr(u *url.URL) string {
+	if u == nil || u.Host == "" {
+		return ""
+	}
+	host, port := u.Hostname(), u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https", "wss":
+			port = "443"
+		case "http", "ws":
+			port = "80"
+		default:
+			return ""
+		}
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func isIndexableAddr(a net.Addr) bool {
@@ -540,6 +617,7 @@ func (c *collector) startRequest(provider, authID string, req *http.Request) *re
 	if req.URL != nil {
 		rec.info.Host = req.URL.Host
 		rec.info.Path = req.URL.Path
+		rec.target = canonicalAddr(req.URL)
 	}
 	c.mu.Lock()
 	c.nextReqID++

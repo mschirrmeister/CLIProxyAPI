@@ -213,7 +213,7 @@ func (t *utlsRoundTripper) dialTLSContext(ctx context.Context, network, addr str
 	if err != nil {
 		return nil, fmt.Errorf("claude oauth tls: dial upstream: %w", err)
 	}
-	conn = connstats.Track(ctx, conn, connstats.KindClaudeOAuth, addr, dialStart)
+	conn = connstats.TrackVia(ctx, conn, connstats.KindClaudeOAuth, addr, t.dialer, dialStart)
 
 	host, _, errSplit := net.SplitHostPort(addr)
 	if errSplit != nil {

@@ -84,12 +84,8 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	c := col
 	rec := c.startRequest(rt.lbl.provider, rt.lbl.authID, req)
 	trace := &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) { c.gotConn(rec, info) },
-		TLSHandshakeStart: func() {
-			c.mu.Lock()
-			rec.tlsStart = time.Now()
-			c.mu.Unlock()
-		},
+		GotConn:           func(info httptrace.GotConnInfo) { c.gotConn(rec, info) },
+		TLSHandshakeStart: func() { c.tlsStarting(rec) },
 		TLSHandshakeDone: func(tls.ConnectionState, error) {
 			c.mu.Lock()
 			if !rec.tlsStart.IsZero() {
