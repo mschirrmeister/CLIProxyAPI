@@ -186,6 +186,7 @@ type trackedBody struct {
 	// touches carry and sawFinal; Close reads sawFinal after the last Read.
 	scan     bool
 	carry    []byte
+	join     []byte // scratch for carry plus the next read, reused
 	sawFinal atomic.Bool
 	// unchecked marks a compressed event stream, which cannot be scanned.
 	unchecked bool
@@ -212,13 +213,14 @@ func (b *trackedBody) Read(p []byte) (int, error) {
 // check looks for a final-event marker in chunk, including one that started
 // in the previous read.
 func (b *trackedBody) check(chunk []byte) {
+	keep := maxMarkerLen - 1
 	if len(b.carry) > 0 {
 		head := chunk
-		if len(head) > maxMarkerLen-1 {
-			head = head[:maxMarkerLen-1]
+		if len(head) > keep {
+			head = head[:keep]
 		}
-		joined := append(b.carry, head...)
-		if containsMarker(joined) {
+		b.join = append(append(b.join[:0], b.carry...), head...)
+		if containsMarker(b.join) {
 			b.sawFinal.Store(true)
 			return
 		}
@@ -227,24 +229,36 @@ func (b *trackedBody) check(chunk []byte) {
 		b.sawFinal.Store(true)
 		return
 	}
-	keep := maxMarkerLen - 1
 	if len(chunk) < keep {
 		// Short read: keep what is left of the old carry in front of it.
-		joined := append(b.carry, chunk...)
-		if len(joined) > keep {
-			joined = joined[len(joined)-keep:]
-		}
-		b.carry = append(b.carry[:0:0], joined...)
+		b.join = append(append(b.join[:0], b.carry...), chunk...)
+		b.carry = append(b.carry[:0], newest(b.join, keep)...)
 		return
 	}
 	b.carry = append(b.carry[:0], chunk[len(chunk)-keep:]...)
 }
 
+// containsMarker reports whether data contains a final-event marker. Every
+// marker starts with a newline, so only the positions of newlines are tried.
 func containsMarker(data []byte) bool {
-	for _, m := range finalEventMarkers {
-		if bytes.Contains(data, m) {
-			return true
+	for i := 0; i < len(data); {
+		j := bytes.IndexByte(data[i:], '\n')
+		if j < 0 {
+			return false
 		}
+		rest := data[i+j:]
+		// Markers continue with "data:" or "event:"; blank lines and other
+		// fields are skipped by their first character.
+		if len(rest) < 2 || (rest[1] != 'd' && rest[1] != 'e') {
+			i += j + 1
+			continue
+		}
+		for _, m := range finalEventMarkers {
+			if bytes.HasPrefix(rest, m) {
+				return true
+			}
+		}
+		i += j + 1
 	}
 	return false
 }

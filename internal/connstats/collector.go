@@ -350,13 +350,26 @@ func (c *collector) addEventLocked(ev Event) {
 	}
 }
 
+// trimLocked drops the oldest history entries. A list may run a quarter over
+// its limit before it is cut back in one copy, so a full history is not copied
+// on every new entry. Snapshots return at most the limit (see newest).
 func (c *collector) trimLocked() {
-	if over := len(c.closed) - c.connHistory; over > 0 {
-		c.closed = append(c.closed[:0:0], c.closed[over:]...)
+	if len(c.closed) > c.connHistory+historySlack(c.connHistory) {
+		c.closed = append(c.closed[:0:0], newest(c.closed, c.connHistory)...)
 	}
-	if over := len(c.requests) - c.reqHistory; over > 0 {
-		c.requests = append(c.requests[:0:0], c.requests[over:]...)
+	if len(c.requests) > c.reqHistory+historySlack(c.reqHistory) {
+		c.requests = append(c.requests[:0:0], newest(c.requests, c.reqHistory)...)
 	}
+}
+
+func historySlack(limit int) int { return limit/4 + 1 }
+
+// newest returns the last limit entries of list.
+func newest[T any](list []T, limit int) []T {
+	if over := len(list) - limit; over > 0 {
+		return list[over:]
+	}
+	return list
 }
 
 // openConn registers a dialed connection. via is the proxy the dialer tunnels
@@ -815,14 +828,14 @@ func (c *collector) snapshot(since time.Time) Snapshot {
 		out.Totals.BytesOut += info.BytesOut
 	}
 	sort.Slice(out.Open, func(i, j int) bool { return out.Open[i].ID < out.Open[j].ID })
-	for _, info := range c.closed {
+	for _, info := range newest(c.closed, c.connHistory) {
 		if !since.IsZero() && info.ClosedAt != nil && info.ClosedAt.Before(since) {
 			continue
 		}
 		info.RequestIDs = append([]uint64(nil), info.RequestIDs...)
 		out.Closed = append(out.Closed, info)
 	}
-	for _, rec := range c.requests {
+	for _, rec := range newest(c.requests, c.reqHistory) {
 		if !since.IsZero() && rec.info.EndedAt != nil && rec.info.EndedAt.Before(since) {
 			continue
 		}
